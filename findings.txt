@@ -1,0 +1,293 @@
+Setup used a Pythia-410m model. Looked particulary at layer 13, head 2. clustered kv vectors into 64 clusters. Tried on approx 50k keys from 50 paragraphs in 2 wiki articles. 
+
+keys were normalized before k means for better clustering 
+
+forward pass -> key extraction -> k means -> per token cluster assignment -> cache for analysis
+
+Measurements: 
+64/64 clusters active. Entropy 5.93 bits / 6.0 ceiling (98.8%).
+" the" (n=186): modal purity 6.5%, position–cluster corr −0.057.
+" lob" fragment (n=21): purity 14.3%, corr +0.125.
+" first" (n=8): purity 25%, corr +0.47.
+" water" (n=1): 100% purity, nan corr.
+Aggregate: 71 tokens with n≥10, mean modal purity 19.76%.
+
+High entropy implies that the clustering is not collapsing and we can see distinct clusters in kv vectors over time. We are able to cluster and therefore the graph can materialize. 
+
+A low position cluster correlation on 'the' implies that although we are using a rotary position encoding, it is not completely telling of the cluster that the embedded key of this token would lie in. So either context or meaning has a role to play. needs analysis
+
+when we look at how the clusters we accessed or indexed as we run through the text, there is a monotonic climb in cluster ids for some reason. not sure why 
+
+water test is useless, only 1 occurence. tells us nothing
+
+modal purity is essentially measuring the fraction of a token's occurrences falling in its single most common cluster. we see a relatively low purity, which implies that the lexical meaning is not enough, the embedding is not enough to tell us where it lies. so the local texture of the tokens around it dictate where it sits. needs some investigation. there is hidden contextual informaiton that we need to unearth. 
+
+also since the test size is tiny, i expect this to increase on a larger test size. since the tokens that acutally pass on a small test size would be the 'the', 'an' and other super common tokens. so there is some bias here. 
+
+so contextual clustering is probably the precndition for the graph sicne we are seeing a signal that the embedding adn the position both are not enough to predict the cluster this key will lie in. so the next hurdle is being able to capture contextual informatio nin the clustering alogirthm. pretty hard 
+
+Need to test if shuffling a piece of text is giivng similar resutls, chanign position. also can check if we have that id climb that we are noticing. also could be an artifcact of a samll test size and does not generalize. 
+
+only one lyaer in one head being tested. 
+
+**At this layer's head a keys clusters is determined by primarily the local context, and weakly by its lexical idenity and not by its position**
+
+So contextual clsutering is the precodntion for he formatio nof the garaph. so a cluster should be referring to this kind of local context, which would make the traversal universal. 
+
+do context defined clusters survive a domain shift?
+
+Gate 1: 
+in a 500 token windowned run, d_val = 0.323 (average residual from wiki key to assigned learned wiki cluster), d_code = 0.394 (average residual from code key to assigned learned wiki cluster), D ~ 0.639 (inter cluster distance on wiki), d_code/D=0.617, d_code/d_val=1.22.
+
+we see that the in domain ratio of key distance to inter cluster distance is 0.5, so thats the threshold that should be used. we see that 1.22 < 1.5 so the vocab transfers somewhat. 
+
+keys sit ~halfway to neighboring centroids in-domain. Cores or smooth distribution is unresolved — histogram of wiki_res pending. Bimodal ⇒ discrete nodes viable; smooth ⇒ k-means cells are the wrong primitive; need to rely on a manifold.
+
+Note the corpus is one wiki + one code file, L13/H2 only; "transfers" is so far a single-head, single-pair claim.
+
+
+--- coverage: wiki held-out, sink excluded  (mean attn mass captured, 4990 steps) ---
+   k |     oracle | flow_graph |  key_graph |    recency |     static
+   1 |      0.759 |      0.217 |      0.217 |      0.217 |      0.217
+   2 |      0.917 |      0.800 |      0.265 |      0.348 |      0.788
+   4 |      0.985 |      0.951 |      0.396 |      0.433 |      0.815
+   8 |      0.997 |      0.986 |      0.454 |      0.494 |      0.839
+  16 |      0.999 |      0.995 |      0.462 |      0.589 |      0.891
+
+--- coverage: CODE (OOD, wiki-trained predictors), sink excluded  (mean attn mass captured, 8483 steps) ---
+   k |     oracle | flow_graph |  key_graph |    recency |     static
+   1 |      0.682 |      0.198 |      0.198 |      0.198 |      0.198
+   2 |      0.873 |      0.668 |      0.253 |      0.331 |      0.686
+   4 |      0.965 |      0.867 |      0.386 |      0.438 |      0.716
+   8 |      0.990 |      0.936 |      0.478 |      0.519 |      0.751
+  16 |      0.998 |      0.967 |      0.499 |      0.606 |      0.830
+
+--- coverage: wiki held-out, sink INCLUDED (reference)  (mean attn mass captured, 4990 steps) ---
+   k |     oracle | flow_graph |  key_graph |    recency |     static
+   1 |      0.798 |      0.136 |      0.136 |      0.136 |      0.136
+   2 |      0.934 |      0.852 |      0.168 |      0.233 |      0.852
+   4 |      0.989 |      0.966 |      0.286 |      0.325 |      0.859
+   8 |      0.998 |      0.990 |      0.379 |      0.415 |      0.882
+  16 |      1.000 |      0.996 |      0.385 |      0.541 |      0.919
+
+--- held-out CE (bits/move): wiki (in-domain) ---
+order 0: 5.984
+order 1: 2.106   (lam=0.9)
+order 2: 1.883   (lam=0.7)
+order 3: 1.935   (lam=0.5)
+
+--- held-out CE (bits/move): code (OOD, wiki-trained) ---
+order 0: 6.015
+order 1: 2.747   (lam=0.9)
+order 2: 2.478   (lam=0.7)
+order 3: 2.511   (lam=0.5)
+
+--- margins: wiki ---
+d1/d2 ratio: median 0.852  p10 0.714  p90 0.962
+frac ambiguous  r>0.90: 32.2%   r>0.95: 14.0%
+gap d2-d1: median 0.0567  (vs median d1 0.3202)
+
+--- margins: code ---
+d1/d2 ratio: median 0.918  p10 0.807  p90 0.986
+frac ambiguous  r>0.90: 58.8%   r>0.95: 33.0%
+gap d2-d1: median 0.0359  (vs median d1 0.3904)
+
+--- bootstrap over wiki windows ---
+self-loop rate: mean 0.697  95% CI [0.687, 0.708]
+off-diag asymmetry: mean 0.616  95% CI [0.587, 0.650]
+(venv) PS C:\Users\johai\Desktop\cross-domain-clustering-experiment> python .\analyze_hub_stale.py
+
+===== pinning 1 hub(s): clusters [16] (train mass share 0.575) =====
+
+--- wiki held-out: hub mass alone 0.573; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.389 |      0.345 |      0.232
+   4 |      0.418 |      0.395 |      0.250
+   8 |      0.425 |      0.417 |      0.273
+
+--- code OOD: hub mass alone 0.489; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.440 |      0.335 |      0.213
+   4 |      0.486 |      0.403 |      0.232
+   8 |      0.503 |      0.454 |      0.269
+
+===== pinning 2 hub(s): clusters [16, 17] (train mass share 0.607) =====
+
+--- wiki held-out: hub mass alone 0.604; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.361 |      0.317 |      0.211
+   4 |      0.387 |      0.365 |      0.224
+   8 |      0.393 |      0.385 |      0.248
+
+--- code OOD: hub mass alone 0.514; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.419 |      0.318 |      0.202
+   4 |      0.463 |      0.385 |      0.217
+   8 |      0.478 |      0.433 |      0.257
+(venv) PS C:\Users\johai\Desktop\cross-domain-clustering-experiment> python .\analyze_hub_stale.py
+
+===== pinning 1 hub(s): clusters [16] (train mass share 0.575) =====
+
+--- wiki held-out: hub mass alone 0.573; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.389 |      0.345 |      0.232
+   4 |      0.418 |      0.395 |      0.250
+   8 |      0.425 |      0.417 |      0.273
+
+--- code OOD: hub mass alone 0.489; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.440 |      0.335 |      0.213
+   4 |      0.486 |      0.403 |      0.232
+   8 |      0.503 |      0.454 |      0.269
+
+===== pinning 2 hub(s): clusters [16, 17] (train mass share 0.607) =====
+
+--- wiki held-out: hub mass alone 0.604; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.361 |      0.317 |      0.211
+   4 |      0.387 |      0.365 |      0.224
+   8 |      0.393 |      0.385 |      0.248
+
+--- code OOD: hub mass alone 0.514; below = ADDITIONAL mass from k non-hub residents ---
+   k |     oracle | flow_graph |     static
+   2 |      0.419 |      0.318 |      0.202
+   4 |      0.463 |      0.385 |      0.217
+   8 |      0.478 |      0.433 |      0.257
+
+
+   (venv) PS C:\Users\johai\Desktop\cross-domain-clustering-experiment> python .\ambiguity_cost.py
+
+--- wiki held-out ---
+ ambiguous (n=1625): identical 5.9%  jaccard 0.504  |  mass: argmax 0.389  runner-up 0.361  soft 0.400
+   control (n=3365): identical 6.0%  jaccard 0.494  |  mass: argmax 0.398  runner-up 0.329  soft 0.397
+
+--- code OOD ---
+ ambiguous (n=4991): identical 5.1%  jaccard 0.450  |  mass: argmax 0.384  runner-up 0.335  soft 0.394
+   control (n=3492): identical 4.9%  jaccard 0.475  |  mass: argmax 0.430  runner-up 0.350  soft 0.429
+(venv) PS C:\Users\johai\Desktop\cross-domain-clustering-experiment> python .\escape_sim.py
+
+--- wiki held-out ---
+  k   m |  h_staged  h_static | lhs=h*min(1,H/L)  verdict |  h_conseq
+  2   1 |     0.889     0.654 |            0.889    STAGE |     0.876
+  2   8 |     0.711     0.654 |            0.711    STAGE |     0.740
+  2  16 |     0.531     0.654 |            0.531  ON-DEMAND |     0.561
+  4   1 |     0.965     0.676 |            0.965    STAGE |     0.964
+  4   8 |     0.879     0.676 |            0.879    STAGE |     0.903
+  4  16 |     0.764     0.676 |            0.764    STAGE |     0.800
+  8   1 |     0.990     0.715 |            0.990    STAGE |     0.988
+  8   8 |     0.970     0.715 |            0.970    STAGE |     0.974
+  8  16 |     0.912     0.715 |            0.912    STAGE |     0.923
+
+--- code OOD ---
+  k   m |  h_staged  h_static | lhs=h*min(1,H/L)  verdict |  h_conseq
+  2   1 |     0.772     0.537 |            0.772    STAGE |     0.740
+  2   8 |     0.640     0.537 |            0.640    STAGE |     0.631
+  2  16 |     0.487     0.537 |            0.487  ON-DEMAND |     0.490
+  4   1 |     0.870     0.572 |            0.870    STAGE |     0.848
+  4   8 |     0.791     0.572 |            0.791    STAGE |     0.780
+  4  16 |     0.686     0.572 |            0.686    STAGE |     0.682
+  8   1 |     0.942     0.627 |            0.942    STAGE |     0.926
+  8   8 |     0.909     0.627 |            0.909    STAGE |     0.901
+  8  16 |     0.865     0.627 |            0.865    STAGE |     0.862
+
+  dialogue] window 40/40
+[dialogue] saved 40 windows -> harvest_dialogue.npz
+
+===== dialogue (19960 steps) =====
+geometry : d_dom 0.340   d_dom/d_val 1.05   d_dom/D 0.53
+hub 16   : key share 0.4%   mass share 0.673   top tokens: '\n', 'Person', ' you', ' are', '#'
+   k |  oracle    flow  static
+   2 |   0.935   0.852   0.872
+   4 |   0.989   0.974   0.888
+   8 |   0.997   0.992   0.902
+escape   : esc% 16.3   h_esc 0.937   h_st_esc 0.156
+[fiction] window 40/40
+[fiction] saved 40 windows -> harvest_fiction.npz
+
+===== fiction (19960 steps) =====
+geometry : d_dom 0.346   d_dom/d_val 1.07   d_dom/D 0.54
+hub 16   : key share 0.4%   mass share 0.590   top tokens: '\n', ',', ' in', 'OF', ' all'
+   k |  oracle    flow  static
+   2 |   0.913   0.770   0.794
+   4 |   0.982   0.949   0.812
+   8 |   0.996   0.984   0.836
+escape   : esc% 26.8   h_esc 0.890   h_st_esc 0.123
+[math] window 40/40
+[math] saved 40 windows -> harvest_math.npz
+
+===== math (19960 steps) =====
+geometry : d_dom 0.357   d_dom/d_val 1.10   d_dom/D 0.56
+hub 16   : key share 0.4%   mass share 0.471   top tokens: '\n', ',', ' the', ' of', '-'
+   k |  oracle    flow  static
+   2 |   0.903   0.745   0.746
+   4 |   0.980   0.923   0.770
+   8 |   0.996   0.970   0.803
+escape   : esc% 34.1   h_esc 0.832   h_st_esc 0.125
+[news] window 40/40
+[news] saved 40 windows -> harvest_news.npz
+
+===== news (19960 steps) =====
+geometry : d_dom 0.344   d_dom/d_val 1.07   d_dom/D 0.54
+hub 16   : key share 0.4%   mass share 0.629   top tokens: '\n', ' of', ' The', '.', ' the'
+   k |  oracle    flow  static
+   2 |   0.914   0.794   0.798
+   4 |   0.985   0.951   0.821
+   8 |   0.998   0.987   0.843
+escape   : esc% 26.7   h_esc 0.902   h_st_esc 0.165
+[wiki_big] window 40/40
+[wiki_big] saved 40 windows -> harvest_wiki_big.npz
+
+===== wiki_big (19960 steps) =====
+geometry : d_dom 0.327   d_dom/d_val 1.01   d_dom/D 0.51
+hub 16   : key share 0.4%   mass share 0.541   top tokens: ' \n', ' =', ' it', ' ,', ' @'
+   k |  oracle    flow  static
+   2 |   0.917   0.797   0.777
+   4 |   0.985   0.954   0.807
+   8 |   0.997   0.988   0.837
+escape   : esc% 29.9   h_esc 0.935   h_st_esc 0.190
+
+===== wiki (4990 steps) =====
+geometry : d_dom 0.323   d_dom/d_val 1.00   d_dom/D 0.51
+hub 16   : key share 0.4%   mass share 0.574   top tokens: '<|endoftext|>'
+   k |  oracle    flow  static
+   2 |   0.917   0.800   0.788
+   4 |   0.985   0.951   0.815
+   8 |   0.997   0.986   0.839
+escape   : esc% 28.0   h_esc 0.923   h_st_esc 0.176
+
+===== code (8483 steps) =====
+geometry : d_dom 0.394   d_dom/d_val 1.22   d_dom/D 0.62
+hub 16   : key share 0.4%   mass share 0.489   top tokens: '<|endoftext|>'
+   k |  oracle    flow  static
+   2 |   0.873   0.668   0.686
+   4 |   0.965   0.867   0.716
+   8 |   0.990   0.936   0.751
+escape   : esc% 42.7   h_esc 0.717   h_st_esc 0.117
+
+===== cross-domain summary (wiki-trained everything) =====
+    domain | d/dval hubmass |  flow@4  stat@4 |  h_esc   h_st
+  dialogue |   1.05   0.673 |   0.974   0.888 |  0.937  0.156
+   fiction |   1.07   0.590 |   0.949   0.812 |  0.890  0.123
+      math |   1.10   0.471 |   0.923   0.770 |  0.832  0.125
+      news |   1.07   0.629 |   0.951   0.821 |  0.902  0.165
+  wiki_big |   1.01   0.541 |   0.954   0.807 |  0.935  0.190
+      wiki |   1.00   0.574 |   0.951   0.815 |  0.923  0.176
+      code |   1.22   0.489 |   0.867   0.716 |  0.717  0.117
+
+      STRUCTURED HEADS: 167
+
+TOP 5
+ layer  qhead  h_esc  h_st_esc  cov4_flow  cov4_static  dH_move  hub_mass
+     1     11  1.000     0.000      0.991        0.957   4.6874     0.024
+     4      6  0.990     0.047      0.965        0.760   4.6946     0.072
+     5     15  0.989     0.060      0.887        0.440   4.5203     0.027
+    13      9  0.982     0.055      0.966        0.833   4.5468     0.222
+     6      2  0.972     0.072      0.981        0.908   4.7617     0.272
+
+BOTTOM 5
+ layer  qhead  h_esc  h_st_esc  cov4_flow  cov4_static  dH_move  hub_mass
+     5      4  0.309     0.117      0.739        0.679   1.7337     0.664
+     9      5  0.308     0.108      0.473        0.435   1.1903     0.304
+     7     10  0.307     0.133      0.593        0.535   1.6007     0.411
+     4      4  0.306     0.082      0.452        0.391   1.6480     0.254
+    23     14  0.265     0.100      0.841        0.817   1.1605     0.349

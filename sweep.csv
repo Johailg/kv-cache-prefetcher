@@ -1,0 +1,3 @@
+layer,qhead,domain,n_steps,d_mean,d_ratio,D,tight_frac,selfloop,H0,H1,dH,dH_move,hub_id,hub_mass,hub_key_frac,hub_ws_frac,hub_pos_mean,tight_in_hub,esc_pct,h_esc,h_st_esc,f_step,local_mass,cov2_oracle,cov2_flow,cov2_static,cov2_recency,cov4_oracle,cov4_flow,cov4_static,cov4_recency,cov8_oracle,cov8_flow,cov8_static,cov8_recency
+13,2,code,19960,8.7531,1.234,13.7669,0.0,0.6984,5.9443,1.654,4.2903,3.6328,56,0.537,0.004,0.658,0.017,0.0,0.404,0.704,0.137,0.567,0.237,0.873,0.68,0.698,0.313,0.965,0.867,0.725,0.42,0.99,0.94,0.753,0.501
+13,2,val,5988,7.0907,1.0,13.7669,0.0,0.6984,5.9443,1.654,4.2903,3.6328,56,0.537,0.0042,0.612,0.188,0.0,0.309,0.931,0.155,0.442,0.264,0.915,0.785,0.773,0.365,0.984,0.946,0.8,0.452,0.996,0.987,0.825,0.508

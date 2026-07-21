@@ -1,0 +1,34 @@
+the fundamental problem is about optimizing the memory controller in the KV cache. every time a layer processes a token, it creates KV pairs and stores it in a cache. this cache grows over time in he processing of an input. studies show that these cluster. now these are not stored ontigously in memory. ClusterKV has built this but its a real cost. not a problem for now. MOdern systems just sotre in via their positional encoding and these are paged. 
+
+so we have keys and values getting stored per token per head per layer. the cache is being written to and read. so every new token needs its key to be assigned to its particular cluster. the thing that is actually moving is the query which changes every decode step. this is the dot product we care about across the enture key space. but we have a distribtuion across all clusters here. nto a particular position. we need to make a decision about how we deal with this. do we just arg max the clusters or do we look at flows from distirbution between steps? Pick argmax for now its simpler. 
+
+the general idea is as follows:
+quantize our latent space where our kv vectors live. observe where clusters form from data and how the query shifhts from cluster to cluster. profiling over this process will give us a graph over this latent sapce whose edge weights are aprporiately formed by observing the moition of he context vector. now this graph needs to be symmetric for everything that follows to hold. this graph is directed. we need to make thsi graph symmetric somehow. Effective Resistance Preserving Directed Graph Symmetrization maybe (i googled this). For now we can just comptue A + A^T. we cna deal with this later if we wnat to. Symmetrization discards the arrow of time (e.g., knowing A to B is frequent but B to A never happens), meaning the graph Laplacian is blind to one-way sequential pipelines.
+
+take this graph and find its laplacian and the eigenvectors of the lapplacian. use the sammles k eigenvetors into the number of clusters we want. these will be used as columns and eack node becomes a row in Rk and we k means ont he rows. 
+
+now we feed in a new prompt and observe where the query lies at the end of an attention run. compute the rayleight quotient. if its low it means we are in distribution of the graph, and if we are stable (compute the cosine similarity between consectuive attention distributuon over the clusters (argmaxed for now which implies binary statbility signal)) we know that our graph is a good call and we can use it. the table unfolds here and we make our decision.
+
+then entire bet is that attention heads possess domain invairant dymanics on their attention over cluster key vectors which would allow for an offline learned topology to predict online locality and help with ood changes during ingerence
+
+Kill Factors: 
+
+Gate 1: Vocabulary Stability (The Distance Ratio)
+Metric: d_OOD / D where d_OOD is the mean Euclidean distance of an OOD key vector to its nearest Wikipedia centroid, and D is the mean pairwise distance between the Wikipedia centroids themselves.
+The In-Domain Anchor: Compute d_val / D on the WikiText validation split first to find the structural floor of the model's natural quantization noise.
+Kill Criterion: d_code / D > 0.40 OR d_code / d_val > 1.5. If the code domain forces vectors to sit nearly halfway between cluster centers, or causes a 50% expansion over the in-domain baseline, the vocabulary does not generalize.
+
+Gate 2: Dynamics Stability (Subspace & Distribution Drift)
+Metric A (Topology): Maximum Principal Angle theta_max between the subspace spanned by the top-4 eigenvectors of L_wiki and the top-4 eigenvectors of L_OOD.
+Kill Criterion A: theta_max > 35 degrees. If the community boundaries rotate past this point, the offline structural partitions will slice directly through the middle of live workloads.
+Metric B (Transitions): Mean Kullback-Leibler Divergence across all rows of the transition matrices: (1 / |V|) * sum_i( D_KL( P_wiki^(i) || P_OOD^(i) ) ).
+Kill Criterion B: Mean D_KL > 0.70 bits. Beyond this threshold, the predictive ranking of successor clusters scrambles completely, turning the Markov prefetcher into random guesswork.
+
+Gate 3: Functional Baseline (The LRU Margin)
+Metric: Absolute difference in token-level KV cache hit rate at an identical fixed cache capacity constraint C (e.g., C = 32 or 64 clusters).
+Kill Criterion: HR_GSP(C) - HR_LRU(C) < 4.0% (Absolute). If the GSP policy cannot outperform a standard, zero-overhead sliding-window LRU cache by at least 4 absolute percentage points on the in-domain or mid-OOD validation sets, the hardware runtime complexity is unjustified.
+
+
+IF the residuals to their clusters is smooth this implies the manifold strucutre is a better fit, if its bi modal then the discrteness allows for k means to work. need to check if the far away mass inthe histogram are telling us about neighbouring keys or not. if so we can jut raise k. 
+
+so the learned manifold will only give us the gemotry, the proximity and undirected edges to construct the grpah. for our purposes however, we will need a representation of hte flow of attention in this grpah. geometry is symmetric, flow is directed — the A vs A+Aᵀ choice becomes important. 
