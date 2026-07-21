@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+models/
+extracted_data/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.synctex.gz
+*.out
+*.fls
+*.fdb_latexmk
+
+# raw corpora — see datasets/README.md for provenance + regeneration
+datasets/*
+!datasets/README.md
