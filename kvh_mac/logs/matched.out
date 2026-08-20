@@ -1,0 +1,16 @@
+/Users/gerry/Desktop/kv-cache-prefetcher/kv-cache-prefetcher/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+`torch_dtype` is deprecated! Use `dtype` instead!
+Qwen/Qwen3-0.6B: layers 28, kv heads 8, head_dim 128
+10 sessions, 18346 tokens, 92 assistant turns
+reference pass (full cache) ...
+  full           budget=1.0     resid 1.0000(+-0.000)  rec 1.0000  ppl 5.226  dppl +0.000  kl 0.0000  top1 1.0000  esc 0.000  rec|esc 0.0000  h_esc nan
+  streaming      budget=0.135   resid 0.1363(+-0.000)  rec 0.7657  ppl 8.629  dppl +3.402  kl nan  top1 0.7533  esc 0.000  rec|esc 0.0000  h_esc nan  [2146s]
+  streaming      budget=0.16    resid 0.1612(+-0.000)  rec 0.7881  ppl 8.089  dppl +2.863  kl nan  top1 0.7760  esc 0.000  rec|esc 0.0000  h_esc nan  [2006s]
+  streaming      budget=0.164   resid 0.1652(+-0.000)  rec 0.7914  ppl 8.021  dppl +2.795  kl nan  top1 0.7779  esc 0.000  rec|esc 0.0000  h_esc nan  [2061s]
+  h2o            budget=0.135   resid 0.1363(+-0.000)  rec 0.7950  ppl 7.657  dppl +2.431  kl nan  top1 0.7631  esc 0.000  rec|esc 0.0000  h_esc nan  [3331s]
+  h2o            budget=0.16    resid 0.1612(+-0.000)  rec 0.8190  ppl 7.109  dppl +1.883  kl nan  top1 0.7869  esc 0.000  rec|esc 0.0000  h_esc nan  [3166s]
+  h2o            budget=0.164   resid 0.1652(+-0.000)  rec 0.8234  ppl 7.017  dppl +1.791  kl nan  top1 0.7941  esc 0.000  rec|esc 0.0000  h_esc nan  [3091s]
+
+wrote results/matched_baselines.csv
+plot d_ppl and kl against RESIDENCY, never against knob.

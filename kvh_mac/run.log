@@ -1,0 +1,18 @@
+=== START Fri Aug 14 23:57:06 IST 2026 ===
+/Users/gerry/Documents/kvh/kvh_mac/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+`torch_dtype` is deprecated! Use `dtype` instead!
+Qwen/Qwen3-0.6B: layers 28, kv heads 8, head_dim 128
+10 sessions, 18346 tokens, 92 assistant turns
+reference pass (full cache) ...
+  full           budget=1.0     resid 1.0000(+-0.000)  rec 1.0000  ppl 5.226  dppl +0.000  kl 0.0000  top1 1.0000  esc 0.000  rec|esc 0.0000  h_esc nan
+  h2o            budget=0.125   resid 0.1263(+-0.000)  rec 0.7842  ppl 7.866  dppl +2.640  kl nan  top1 0.7523  esc 0.000  rec|esc 0.0000  h_esc nan  [3004s]
+  h2o            budget=0.06    resid 0.0614(+-0.000)  rec 0.6693  ppl 12.804  dppl +7.578  kl nan  top1 0.6317  esc 0.000  rec|esc 0.0000  h_esc nan  [2939s]
+  h2o            budget=0.03    resid 0.0315(+-0.000)  rec 0.5647  ppl 23.434  dppl +18.207  kl nan  top1 0.5232  esc 0.000  rec|esc 0.0000  h_esc nan  [2942s]
+  snapkv         budget=0.125   resid 0.2318(+-0.000)  rec 0.8794  ppl 7.036  dppl +1.809  kl nan  top1 0.8303  esc 0.000  rec|esc 0.0000  h_esc nan  [2996s]
+  snapkv         budget=0.06    resid 0.1777(+-0.000)  rec 0.8548  ppl 7.539  dppl +2.313  kl nan  top1 0.8116  esc 0.000  rec|esc 0.0000  h_esc nan  [2893s]
+  snapkv         budget=0.03    resid 0.1577(+-0.000)  rec 0.8393  ppl 7.857  dppl +2.631  kl nan  top1 0.8010  esc 0.000  rec|esc 0.0000  h_esc nan  [2233s]
+
+wrote results/ppl_tok_fixed.csv
+plot d_ppl and kl against RESIDENCY, never against knob.
+=== EXIT 0 at Sat Aug 15 05:12:41 IST 2026 ===

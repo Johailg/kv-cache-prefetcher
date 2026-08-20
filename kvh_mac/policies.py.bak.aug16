@@ -1,0 +1,963 @@
+"""
+kvh.policies -- cache-selection policies under one interface.
+
+Read kvh/shapes.py first. Every shape annotation here uses that vocabulary.
+
+WHAT A POLICY IS
+----------------
+A policy answers one question, once per forward call, per (layer, kv_head):
+
+    of the n_old KV entries already in the cache, which ones are resident?
+
+It returns a bool mask of shape [Hkv, n_old]. True means resident.
+Returning None means "keep everything".
+
+TWO RULES EVERY POLICY OBEYS
+----------------------------
+1. Columns [n_old, K) -- keys written by this call -- are always resident.
+   The policy is never even shown them. attn.py adds them.
+2. Columns [0, n_sink) are pinned. Every select() ends with self._pin_sinks().
+   Without this, everything collapses to the same floor and the table is
+   meaningless.
+
+CALL ORDER PER STEP  (enforced in attn.py, relied on here)
+----------------------------------------------------------
+    policy.select(layer, n_old, n_new)   ->  mask
+    policy.note_keys(layer, keys_new)    ->  updates cluster state
+    ... attention is computed ...
+    policy.observe(obs)                  ->  updates score state
+
+select-before-note_keys is what makes `cur` equal c[t-1]. See shapes.py.
+
+BUDGET
+------
+Token policies take `budget`. Two forms, and the papers use the second:
+
+    budget < 1   fraction of the pre-existing cache
+                 keep_old = clamp(round(budget * n_old), n_sink, n_old)
+    budget >= 1  ABSOLUTE number of old columns, the papers' formulation
+                 keep_old = clamp(int(budget), n_sink, n_old)
+
+The absolute form matters for more than tidiness. Under the fractional form
+`keep` starts tiny: at budget 0.03 the n_sink floor means every token policy
+is literally sink_only until n_old > 133, and near-sink_only for a while
+after. No paper does that -- H2O returns the cache untouched while
+seq_len <= cache_size, and SnapKV skips compression entirely while
+q_len < max_capacity_prompt. Under the absolute form kvh matches them,
+because keep = min(n_old, cap) = n_old until the cache outgrows the cap.
+See kvh/starvation_check.py for what this cost the fractional runs.
+
+Cluster policies take `k` and quantise to whole clusters, so they land where
+they land. Neither number is the x-axis. The harness measures realised
+residency and every result is plotted against that. Fixed k is not fixed
+budget.
+
+SINK ACCOUNTING
+---------------
+CHARGE_SINKS below decides whether the n_sink pinned columns are paid for out
+of `keep` or handed out on top of it. True is the consistent choice: it makes
+the knob mean the same thing for every token policy, and -- the part that
+actually changes results -- it takes the sink columns out of the content
+contest. Position 0 carries ~0.44 of row mass on Qwen3-0.6B, so an unguarded
+top-k spends its highest-scoring slots on columns that are pinned anyway.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+import torch
+
+
+# Sinks are paid for out of the budget AND excluded from every content top-k.
+# Set False to reproduce the pre-Aug-13 rows exactly (uncharged, contested).
+CHARGE_SINKS = True
+
+
+# ==========================================================================
+# what a policy sees after the fact
+# ==========================================================================
+
+@dataclass
+class Obs:
+    """Passed to Policy.observe() once per forward call.
+
+    All mass tensors are [Hkv, K] float32, already summed/averaged over the
+    G query heads in each KV group.
+
+    col_mass_resident   raw softmax mass from the MASKED distribution, summed
+                        over ALL query rows and over the G heads. This is what
+                        a deployed system could actually observe: an evicted
+                        key contributes zero, so score accumulation is
+                        self-reinforcing. H2O uses this one.
+
+    col_mass_resident_lastw
+                        the same masked mass, but summed over only the LAST
+                        `policy.obs_rows` query rows of the call. None unless
+                        the policy asked for it by setting obs_rows > 0.
+                        SnapKV needs this and nothing else does.
+
+                        Why it is a separate field rather than a smaller
+                        version of the one above: under a causal mask, column
+                        j of col_mass_resident receives contributions from
+                        rows j..Q-1, so it carries a monotone recency PENALTY
+                        -- rank correlation with position measured at -0.974
+                        on synthetic prefills. Every one of the last W rows
+                        sees the entire prefix, so col_mass_resident_lastw has
+                        a flat support and no positional bias at all (-0.062).
+                        That flatness is the whole point of SnapKV's
+                        observation window.
+
+    col_mass_true       same as the first, but from the unmasked distribution.
+                        Reading it makes a policy an oracle; only Oracle does,
+                        and it does so through set_peek() rather than here.
+
+    col_mass_nosink     the mt_harvest convention: per query head, zero column
+                        0, RENORMALISE the row, then average over the G heads.
+                        At a decode step (Q == 1) each row sums to 1. This is
+                        what mass_nosink is built from, and the only one the
+                        escape event and the flow graph may use.
+    """
+    layer: int
+    col_mass_resident: torch.Tensor      # [Hkv, K]
+    col_mass_true: torch.Tensor          # [Hkv, K]
+    col_mass_nosink: torch.Tensor        # [Hkv, K]
+    n_old: int
+    n_new: int
+    is_prefill: bool                     # True when Q > 1
+    col_mass_resident_lastw: Optional[torch.Tensor] = None   # [Hkv, K] or None
+
+
+# ==========================================================================
+# base class
+# ==========================================================================
+
+class Policy:
+    name: str = "base"
+    granularity: str = "none"            # "token" | "cluster" | "none"
+    needs_true_attention: bool = False   # True == this is an oracle, not a baseline
+    n_sink: int = 4
+    obs_rows: int = 0                    # >0 asks attn.py to retain the last N rows
+
+    # -- lifecycle --------------------------------------------------------
+
+    def reset(self, n_layers, n_kv_heads, head_dim, device, dtype) -> None:
+        """Called once per sequence, before any forward call."""
+        self.n_layers = n_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.device = device
+        self.dtype = dtype
+
+    def select(self, layer: int, n_old: int, n_new: int) -> Optional[torch.Tensor]:
+        """-> bool [Hkv, n_old], or None to keep everything."""
+        return None
+
+    def note_keys(self, layer: int, keys_new: torch.Tensor) -> None:
+        """keys_new: [Hkv, n_new, D], post-rotary, exactly as written to cache.
+        Called AFTER select() for this step."""
+
+    def observe(self, obs: Obs) -> None:
+        """Called after the masked attention output has been computed."""
+
+    def chosen_clusters(self, layer: int) -> Optional[torch.Tensor]:
+        """-> bool [Hkv, C] for the escape readout, or None for token policies."""
+        return None
+
+    # -- helpers used by subclasses ---------------------------------------
+
+    def _budget_to_count(self, n_old: int, budget: float) -> int:
+        """Budget knob -> an integer number of old columns to keep.
+
+        budget < 1  is a resident fraction; budget >= 1 is an absolute cache
+        size, which is the form every paper actually uses. See the module
+        docstring for why the difference is not cosmetic at low budgets.
+        """
+        raw = int(budget) if budget >= 1.0 else round(budget * n_old)
+        floor = min(self.n_sink, n_old)      # never ask for fewer than the sinks
+        return int(min(n_old, max(floor, raw)))
+
+    def _empty_mask(self, n_old: int) -> torch.Tensor:
+        return torch.zeros(self.n_kv_heads, n_old, dtype=torch.bool,
+                           device=self.device)
+
+    def _pin_sinks(self, mask: torch.Tensor) -> torch.Tensor:
+        """Force columns [0, n_sink) resident. Every select() ends with this."""
+        s = min(self.n_sink, mask.shape[1])
+        if s > 0:
+            mask[:, :s] = True
+        return mask
+
+    def _keep_top(self, scores: torch.Tensor, how_many: int) -> torch.Tensor:
+        """scores [Hkv, n_old] -> bool mask keeping the top `how_many` per head.
+
+        Under CHARGE_SINKS the sink columns are removed from the contest and
+        their slots deducted from `how_many`, so the returned mask has exactly
+        `how_many` resident columns rather than up to how_many + n_sink, and
+        no content slot is spent on a column that _pin_sinks would keep anyway.
+        """
+        n_old = scores.shape[1]
+        how_many = int(min(max(how_many, 0), n_old))
+        mask = self._empty_mask(n_old)
+        n_s = min(self.n_sink, n_old) if CHARGE_SINKS else 0
+        if n_s > 0:
+            scores = scores.clone()
+            scores[:, :n_s] = float("-inf")
+            how_many = max(0, how_many - n_s)
+        if how_many > 0:
+            top = scores.topk(min(how_many, n_old), dim=1).indices   # [Hkv, m]
+            mask.scatter_(1, top, True)
+        return self._pin_sinks(mask)
+
+
+# ==========================================================================
+# controls: the floor, the ceiling, and noise
+# ==========================================================================
+
+class FullCache(Policy):
+    """No eviction. The reference every other row is measured against."""
+    name, granularity = "full", "none"
+
+
+class SinkOnly(Policy):
+    """Sinks and nothing else. The floor a real policy must clear."""
+    name, granularity = "sink_only", "token"
+
+    def __init__(self, n_sink: int = 4):
+        self.n_sink = n_sink
+
+    def select(self, layer, n_old, n_new):
+        return self._pin_sinks(self._empty_mask(n_old))
+
+
+class RandomKeep(Policy):
+    """Budget-matched noise. A policy that cannot beat this is not a policy."""
+    name, granularity = "random", "token"
+
+    def __init__(self, budget: float, n_sink: int = 4, seed: int = 0):
+        self.budget = budget
+        self.n_sink = n_sink
+        self.seed = seed
+
+    def reset(self, *a, **kw):
+        super().reset(*a, **kw)
+        # CPU generator so the draw is reproducible across devices
+        self._rng = torch.Generator(device="cpu").manual_seed(self.seed)
+
+    def select(self, layer, n_old, n_new):
+        noise = torch.rand(self.n_kv_heads, n_old, generator=self._rng)
+        return self._keep_top(noise.to(self.device),
+                              self._budget_to_count(n_old, self.budget))
+
+
+class Oracle(Policy):
+    """Top-budget by the attention that is about to be placed. The ceiling.
+
+    Gets its information through set_peek(), which attn.py calls only for
+    policies with needs_true_attention = True. That costs a second full
+    attention pass for this policy, which is why it is opt-in.
+    """
+    name, granularity = "oracle", "token"
+    needs_true_attention = True
+
+    def __init__(self, budget: float, n_sink: int = 4):
+        self.budget = budget
+        self.n_sink = n_sink
+
+    def reset(self, *a, **kw):
+        super().reset(*a, **kw)
+        self._peek: Dict[int, torch.Tensor] = {}
+
+    def set_peek(self, layer: int, col_mass_true_old: torch.Tensor) -> None:
+        """col_mass_true_old: [Hkv, n_old] -- this step's true mass on old keys."""
+        self._peek[layer] = col_mass_true_old
+
+    def select(self, layer, n_old, n_new):
+        peek = self._peek.get(layer)
+        if peek is None or peek.shape[1] != n_old:
+            return None
+        return self._keep_top(peek, self._budget_to_count(n_old, self.budget))
+
+
+# ==========================================================================
+# token-granular baselines: the eviction literature
+# ==========================================================================
+
+class StreamingLLM(Policy):
+    """Sinks plus a sliding recent window. No content signal at all.
+
+    Faithful to 2309.17453 in this regime with one caveat worth stating in any
+    write-up: the paper re-assigns RoPE positions to positions WITHIN the cache
+    and caches keys pre-rotary to do it, while note_keys receives post-rotary
+    keys. At 2048 tokens on a 32k-context model the positions never leave the
+    trained range, so this reduces to window-attention-with-sinks, which is
+    what the paper's method reduces to inside the training window. It would
+    matter, and would favour the paper, past the training window.
+
+    This policy charges the sinks against the budget, matching the paper's
+    x + y accounting. Since CHARGE_SINKS it is no longer the only one that does.
+    """
+    name, granularity = "streaming", "token"
+
+    def __init__(self, budget: float, n_sink: int = 4):
+        self.budget = budget
+        self.n_sink = n_sink
+
+    def select(self, layer, n_old, n_new):
+        keep = self._budget_to_count(n_old, self.budget)
+        window = max(0, keep - min(self.n_sink, n_old))   # sinks already cost slots
+        mask = self._empty_mask(n_old)
+        if window > 0:
+            mask[:, n_old - window:] = True
+        return self._pin_sinks(mask)
+
+
+class H2O(Policy):
+    """Half the budget to a recent window, half to accumulated attention mass.
+
+    Verified against H2OKVCache_LayerWise.__call__ from the authors' released
+    h2o_hf/utils_real_drop implementation; see kvh/gate_baselines.py. Three
+    properties of that reference this class reproduces:
+
+    1. Accumulation uses col_mass_RESIDENT, not the true mass. An evicted key
+       cannot earn score, so eviction is self-reinforcing. That is H2O as
+       deployed; scoring on the true mass would be a different (easier) method.
+
+    2. Heavy hitters are drawn ONLY from the non-recent prefix -- the reference
+       slices hh_score[:, :seq_len - recent_size] before its top-k, and the
+       recent window is added afterwards, never contested.
+
+    3. EVICTION IS IRREVERSIBLE. The reference physically compacts hh_score to
+       the survivors, so a dropped key has no score to be re-selected on. The
+       old kvh recomputed a fresh top-k from a full-width score array every
+       step, and since `keep` grows with n_old under a fractional budget, a
+       previously-dropped token could re-enter purely because the budget
+       widened. `_evicted` is a monotone ledger that closes that.
+
+    Notice that (3) also delivers the paper's |S_i \\ S_{i-1}| <= 1: with the
+    ledger, evictions at a decode step equal keep(n_old) + 1 - keep(n_old + 1),
+    which is 1 - budget for a fractional knob and exactly 1 for an absolute one.
+
+    Remaining known deviations, both documented rather than fixed:
+      - group_sum collapses the G query heads sharing a KV head into one
+        keep/drop decision. Paper H2O is per attention head. SnapKV inherits
+        the same constraint, so it is not a differentiator between token and
+        cluster policies.
+      - the sink pin has no counterpart in the paper, which has no sink
+        concept at all. Under CHARGE_SINKS it costs budget and is excluded
+        from the heavy contest, so it cannot silently eat content slots.
+    """
+    name, granularity = "h2o", "token"
+
+    def __init__(self, budget: float, heavy_ratio: float = 0.5,
+                 n_sink: int = 4, decay: float = 1.0):
+        self.budget = budget
+        self.heavy_ratio = heavy_ratio      # share of the budget given to heavy hitters
+        self.n_sink = n_sink
+        self.decay = decay                  # 1.0 = plain running sum
+
+    def reset(self, *a, **kw):
+        super().reset(*a, **kw)
+        self._score: Dict[int, torch.Tensor] = {}     # layer -> [Hkv, K_so_far]
+        self._evicted: Dict[int, torch.Tensor] = {}   # layer -> [Hkv, K_so_far] bool
+
+    def observe(self, obs):
+        new = obs.col_mass_resident.float()            # [Hkv, K]
+        old = self._score.get(obs.layer)
+        if old is None:
+            self._score[obs.layer] = new
+            return
+        if old.shape[1] < new.shape[1]:
+            grown = torch.zeros_like(new)
+            grown[:, :old.shape[1]] = old
+            old = grown
+        self._score[obs.layer] = old * self.decay + new
+
+    def _evicted_ledger(self, layer: int, n_old: int) -> torch.Tensor:
+        """[Hkv, n_old] bool, True == dropped at some earlier step and gone for
+        good. Grown in place; columns written since the last call start False."""
+        ev = self._evicted.get(layer)
+        if ev is None or ev.shape[1] < n_old:
+            grown = torch.zeros(self.n_kv_heads, n_old, dtype=torch.bool,
+                                device=self.device)
+            if ev is not None:
+                grown[:, :ev.shape[1]] = ev
+            ev = grown
+            self._evicted[layer] = ev
+        return ev
+
+    def select(self, layer, n_old, n_new):
+        if n_old == 0:
+            return None
+        ev = self._evicted_ledger(layer, n_old)[:, :n_old]
+
+        keep = self._budget_to_count(n_old, self.budget)
+        n_s = min(self.n_sink, n_old) if CHARGE_SINKS else 0
+        free = max(0, keep - n_s)
+        n_recent = int(round(free * (1.0 - self.heavy_ratio)))
+        n_heavy = free - n_recent
+
+        mask = self._empty_mask(n_old)
+        if n_recent > 0:
+            mask[:, max(0, n_old - n_recent):] = True
+        mask &= ~ev                    # the window cannot resurrect a dropped key
+
+        score = self._score.get(layer)
+        if score is not None and n_heavy > 0:
+            s = score[:, :n_old].float().clone()
+            s[mask] = float("-inf")                    # do not re-spend recent slots
+            s[ev] = float("-inf")                      # evicted is forever
+            if n_s > 0:
+                s[:, :n_s] = float("-inf")             # sinks are free, not heavy
+            top = s.topk(min(n_heavy, n_old), dim=1)
+            # a head with fewer than n_heavy eligible columns gets -inf padding
+            # back from topk; scatter the validity flags, not a blanket True.
+            mask.scatter_(1, top.indices, torch.isfinite(top.values))
+
+        mask = self._pin_sinks(mask)
+        # record AFTER pinning, so a sink is never entered in the ledger
+        self._evicted[layer][:, :n_old] |= ~mask
+        return mask
+
+
+class SnapKV(Policy):
+    """Score the old cache by attention from the last `obs_window` prefill
+    query rows, max-pool over position, keep top-n. Computed once per prefill
+    and FROZEN through the decode that follows -- that is SnapKV's actual shape
+    and the reason it can degrade over a long generation.
+
+    Verified against SnapKVCluster.update_kv from the authors' released
+    snapkv/monkeypatch/snapkv_utils.py; see kvh/gate_baselines.py. What that
+    reference does, and this now does:
+
+      score  = softmax(Q[-W:] K^T / sqrt(d)).sum over the W rows,
+               restricted to the PREFIX columns [0, P-W)
+      pooled = maxpool1d(score, kernel, stride 1, pad kernel//2)
+      keep   = topk(pooled, cap - W)  UNION  [P-W, P)
+
+    Four things changed here from the previous version, three of which were
+    hurting the baseline:
+
+    1. THE OBSERVATION WINDOW IS REAL NOW. It used to score with
+       col_mass_resident, a sum over ALL Q prefill rows. Under a causal mask
+       column j gets Q-j contributions, so that score was a position ranking
+       with an attention tie-break -- measured rank correlation with position
+       -0.974, against -0.062 for the last-W score. This inverted SnapKV's
+       central idea rather than merely approximating it. attn.py now retains
+       the last `obs_rows` rows for exactly this.
+    2. THE WINDOW IS FORCE-KEPT. The paper concatenates k_obs unconditionally.
+       The old pin landed on decode columns that mask[:, P_:] had already made
+       resident, so after W decode steps it was a no-op and the last W prompt
+       tokens had to win the (biased) top-k to survive.
+    3. THE PREFIX IS SCORED, NOT THE WHOLE CACHE. The reference sums
+       attn_weights[..., -W:, :-W]; the window columns are never candidates.
+       The old code also pooled across the sink columns, so sink mass leaked
+       up to kernel//2 positions rightward and inflated its neighbours.
+    4. THE BUDGET IS FROZEN AT COMPRESSION TIME, as max_capacity_prompt is.
+       The old code re-derived keep = budget * n_old every decode step, so it
+       widened as the cache grew.
+
+    Deliberately NOT changed, and both belong in the write-up:
+      - Re-compressing at every user prefill. SnapKV is single-prompt; the
+        paper says nothing about turn 2. Never re-compressing would be the
+        only alternative and is clearly worse. Call it an extension, not
+        SnapKV.
+      - Keys written after a compression stay resident until the next one,
+        which is what the paper does with generated tokens. It is also why
+        SnapKV's realised residency floats up and barely tracks the knob in a
+        multi-turn session -- report that as a property of SnapKV, not as a
+        caveat about the harness.
+    """
+    name, granularity = "snapkv", "token"
+
+    def __init__(self, budget: float, obs_window: int = 32, pool: int = 7,
+                 pooling: str = "max", n_sink: int = 4):
+        self.budget = budget
+        self.obs_window = obs_window
+        self.pool = pool                    # odd pooling kernel, SnapKV's clustering step
+        self.pooling = pooling              # "max" (paper LongBench) | "avg" (repo default)
+        self.n_sink = n_sink
+        self.obs_rows = obs_window          # attn.py reads this
+
+    def reset(self, *a, **kw):
+        super().reset(*a, **kw)
+        self._score: Dict[int, torch.Tensor] = {}     # layer -> [Hkv, prefix]
+        self._plan: Dict[int, tuple] = {}             # layer -> (P, W, prefix, keep)
+
+    def observe(self, obs):
+        if not obs.is_prefill:
+            return
+        rows = obs.col_mass_resident_lastw
+        if rows is None:
+            raise RuntimeError(
+                "snapkv needs the last-W observation window but attn.py did "
+                "not supply col_mass_resident_lastw. The harness reads "
+                "policy.obs_rows -- update attn.py alongside this file.")
+        P = obs.n_old + obs.n_new
+        W = min(self.obs_window, P)
+        prefix = max(0, P - W)
+        self._score[obs.layer] = rows[:, :prefix].float().clone()
+        self._plan[obs.layer] = (P, W, prefix, self._budget_to_count(P, self.budget))
+
+    def select(self, layer, n_old, n_new):
+        if n_old == 0:
+            return None
+        plan = self._plan.get(layer)
+        if plan is None:                      # nothing compressed yet
+            return self._pin_sinks(self._empty_mask(n_old))
+        P, W, prefix, keep = plan
+        if keep >= P:
+            return None                       # reference returns the cache untouched
+        prefix = min(prefix, n_old)
+
+        mask = self._empty_mask(n_old)
+        mask[:, prefix:] = True               # window + everything written since
+        n_s = min(self.n_sink, n_old) if CHARGE_SINKS else 0
+        remaining = keep - W - n_s
+
+        if remaining > 0 and prefix > 0:
+            s = self._score[layer][:, :prefix].clone()          # [Hkv, prefix]
+            # keep sink mass out of the pooling window as well as the top-k,
+            # or it leaks kernel//2 positions rightward. -inf is inert under a
+            # max-pool; avg-pool needs a zero instead.
+            fill = float("-inf") if self.pooling == "max" else 0.0
+            if n_s > 0:
+                s[:, :n_s] = fill
+            if self.pool > 1:
+                op = (torch.nn.functional.max_pool1d if self.pooling == "max"
+                      else torch.nn.functional.avg_pool1d)
+                s = op(s.unsqueeze(1), kernel_size=self.pool, stride=1,
+                       padding=self.pool // 2).squeeze(1)[:, :prefix]
+            if n_s > 0:
+                s[:, :n_s] = float("-inf")
+            top = s.topk(min(remaining, prefix), dim=1)
+            mask.scatter_(1, top.indices, torch.isfinite(top.values))
+
+        return self._pin_sinks(mask)
+
+
+# ==========================================================================
+# the cluster lineage
+# ==========================================================================
+
+@dataclass
+class ClusterIndex:
+    """Everything kvh.harvest fits offline, per (layer, kv_head).
+
+    centroids  [L, Hkv, C, D]   RAW KMeans centres. NOT renormalised.
+    hubs       [L, Hkv, n_hub]  int64 cluster ids, per head
+    flow       [L, Hkv, C, C]   row-stochastic; hub COLUMNS zeroed  (or None)
+    freq       [L, Hkv, C]      `g`, the train-global mean mass; hub entries
+                                zeroed                                (or None)
+
+    Why the centroids are not renormalised: mt_harvest.dists_to assigns by
+    euclidean distance to the raw KMeans centres. Those centres sit strictly
+    inside the unit sphere, so ||c|| varies per cluster and
+
+        argmin ||x - c||    !=    argmax x.c
+
+    Renormalising and using cosine is a different assignment, hence a different
+    lineage, hence numbers that cannot be compared to canon.
+    """
+    centroids: torch.Tensor
+    hubs: torch.Tensor
+    flow: Optional[torch.Tensor] = None
+    freq: Optional[torch.Tensor] = None
+    local_frac: Optional[torch.Tensor] = None   # [L, Hkv] offset-rule guardrail
+
+    @property
+    def n_clusters(self) -> int:
+        return self.centroids.shape[2]
+
+    def to(self, device, dtype=torch.float32) -> "ClusterIndex":
+        hubs = self.hubs
+        if hubs.dim() == 2:                    # [L, Hkv] -> [L, Hkv, 1]
+            hubs = hubs.unsqueeze(-1)
+        move = lambda t: None if t is None else t.to(device=device, dtype=dtype)
+        return ClusterIndex(self.centroids.to(device=device, dtype=dtype),
+                            hubs.to(device=device), move(self.flow),
+                            move(self.freq), move(self.local_frac))
+
+    def assign(self, layer: int, keys: torch.Tensor) -> torch.Tensor:
+        """keys [Hkv, n, D] -> cluster ids [Hkv, n] int64.
+
+        L2-normalise the keys (mt_harvest NORMALIZE_KEYS), then euclidean
+        nearest centroid. torch.cdist is the direct transcription of
+        mt_harvest.dists_to.
+        """
+        unit = torch.nn.functional.normalize(keys.float(), dim=-1)   # [Hkv, n, D]
+        dist = torch.cdist(unit, self.centroids[layer])              # [Hkv, n, C]
+        return dist.argmin(dim=-1)                                   # [Hkv, n]
+
+    def hub_mask(self, layer: int) -> torch.Tensor:
+        """-> bool [Hkv, C], True at this head's hub cluster(s)."""
+        n_heads, n_c = self.centroids.shape[1], self.n_clusters
+        mask = torch.zeros(n_heads, n_c, dtype=torch.bool,
+                           device=self.centroids.device)
+        mask.scatter_(1, self.hubs[layer], True)
+        return mask
+
+
+# ==========================================================================
+# cluster-granular policies
+# ==========================================================================
+
+def _take_best(chosen: torch.Tensor, scores: torch.Tensor,
+               how_many: torch.Tensor) -> torch.Tensor:
+    """Add up to how_many[h] more clusters per head, best-scoring first,
+    skipping any already in `chosen` and any scored -inf.
+
+    chosen    bool  [Hkv, C]   modified copy returned
+    scores    float [Hkv, C]   -inf means ineligible
+    how_many  int   [Hkv]      per-head slot count, may differ across heads
+
+    This is the vectorised form of the append loop inside mt_common.topk.
+    The per-head count varies because `cur` costs a slot on heads where it is
+    not the hub, and costs nothing on heads where it is.
+    """
+    most = int(how_many.max().item())
+    if most <= 0:
+        return chosen
+
+    eligible = scores.masked_fill(chosen, float("-inf"))        # [Hkv, C]
+    top = eligible.topk(min(most, eligible.shape[1]), dim=1).indices   # [Hkv, m]
+
+    rank = torch.arange(top.shape[1], device=chosen.device)     # [m]
+    within_quota = rank.unsqueeze(0) < how_many.unsqueeze(1)    # [Hkv, m]
+    is_real = torch.isfinite(torch.gather(eligible, 1, top))    # drops -inf padding
+    take = within_quota & is_real                               # [Hkv, m]
+
+    addition = torch.zeros_like(chosen)
+    addition.scatter_(1, top, take)
+    return chosen | addition
+
+
+class _ClusterPolicy(Policy):
+    """Shared machinery for every cluster-granular policy.
+
+    Tracks, per layer:
+      _assign[layer]  [Hkv, n]  cluster id of every cached position, in order
+      _last[layer]    [Hkv, C]  step index at which each cluster was last written
+      _chosen[layer]  [Hkv, C]  the cluster set selected at the last step
+
+    THE BUDGET RULE (mt_common.topk):
+        resident clusters = hubs  |  topk_set,   |topk_set| = k
+
+    Hubs are pinned OUTSIDE k. topk() returns k non-hub clusters and the hub is
+    physically resident on top of them. So k=4 costs 5 clusters of residency,
+    not 4. Charging the hub to k would halve the budget at k=2, which is
+    exactly where the only surviving flow margin lives.
+
+    h_esc is unaffected either way: the escape event zeroes hubs before taking
+    the argmax, so cstar can never be a hub and having hubs in `chosen` cannot
+    manufacture a hit.
+    """
+    granularity = "cluster"
+
+    def __init__(self, index: ClusterIndex, k: int, n_sink: int = 4):
+        self.index = index
+        self.k = k
+        self.n_sink = n_sink
+
+    def reset(self, n_layers, n_kv_heads, head_dim, device, dtype):
+        super().reset(n_layers, n_kv_heads, head_dim, device, dtype)
+        self.index = self.index.to(device)
+        self._assign: Dict[int, torch.Tensor] = {}
+        self._last: Dict[int, torch.Tensor] = {}
+        self._step: Dict[int, int] = {}
+        self._chosen: Dict[int, torch.Tensor] = {}
+
+    # -- state update -----------------------------------------------------
+
+    def note_keys(self, layer, keys_new):
+        ids = self.index.assign(layer, keys_new)             # [Hkv, n_new]
+
+        seen = self._assign.get(layer)
+        self._assign[layer] = ids if seen is None else torch.cat([seen, ids], dim=1)
+
+        if layer not in self._last:
+            # -inf, not -1: a cluster that has never been written must be
+            # unreachable by recency. _take_best drops non-finite scores, so
+            # with -inf a short history yields FEWER than k clusters, which is
+            # what mt_common.recency_set does. A finite sentinel would let the
+            # policy stage clusters that do not exist in the cache.
+            self._last[layer] = torch.full(
+                (self.n_kv_heads, self.index.n_clusters),
+                float("-inf"), device=self.device)
+            self._step[layer] = 0
+
+        # move-to-front: stamp each written cluster with its absolute step index.
+        # scatter_ with duplicate indices keeps the LAST write, which is the
+        # largest step index, so this is a correct "most recent" stamp.
+        first = self._step[layer]
+        stamps = torch.arange(first, first + ids.shape[1], device=self.device,
+                              dtype=torch.float32)                     # [n_new]
+        self._last[layer].scatter_(1, ids, stamps.unsqueeze(0).expand(self.n_kv_heads, -1))
+        self._step[layer] = first + ids.shape[1]
+
+    # -- selection --------------------------------------------------------
+
+    def _flow_row(self, layer: int, cur: torch.Tensor) -> torch.Tensor:
+        """-> [Hkv, C], row `cur[h]` of this head's transition matrix."""
+        if self.index.flow is None:
+            return torch.zeros(self.n_kv_heads, self.index.n_clusters,
+                               device=self.device)
+        heads = torch.arange(self.n_kv_heads, device=self.device)
+        return self.index.flow[layer][heads, cur]
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        """Subclass hook. `chosen` already holds the hubs and cur; `free` [Hkv]
+        is how many of the k slots are still unspent."""
+        raise NotImplementedError
+
+    def select(self, layer, n_old, n_new):
+        assign = self._assign.get(layer)
+        if assign is None or n_old == 0:
+            return None                                  # nothing written yet
+        assign_old = assign[:, :n_old]                   # [Hkv, n_old]
+        heads = torch.arange(self.n_kv_heads, device=self.device)
+
+        hub = self.index.hub_mask(layer)                 # [Hkv, C]
+        cur = assign_old[:, -1]                          # [Hkv] -- this is c[t-1]
+
+        chosen = hub.clone()                             # hubs: free, outside k
+        cur_is_hub = hub[heads, cur]                     # [Hkv] bool
+        chosen[heads, cur] = True                        # seed the live cluster
+        spent = (~cur_is_hub).long()                     # cur costs a slot only if non-hub
+        free = (self.k - spent).clamp_min(0)             # [Hkv]
+
+        chosen = self._fill_budget(layer, chosen, hub, cur, free)
+        self._chosen[layer] = chosen
+
+        # cluster set -> token mask: a column is resident iff its cluster is in.
+        return self._pin_sinks(torch.gather(chosen, 1, assign_old))
+
+    def chosen_clusters(self, layer):
+        return self._chosen.get(layer)
+
+
+class ClusterFlow(_ClusterPolicy):
+    """The method.  mt_common: topk(P[c[t-1]], cur=c[t-1], k, hubs)"""
+    name = "flow"
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        row = self._flow_row(layer, cur).masked_fill(hub, float("-inf"))
+        return _take_best(chosen, row, free)
+
+
+class ClusterStatic(_ClusterPolicy):
+    """Global mean mass rank.  mt_eval: topk(g_wiki, cur, k, hubs)
+
+    Note that static also seeds cur, so it is not a pure frequency policy --
+    it is frequency plus the live cluster, which is how escape_sim_v2 defines
+    it and why its floor is `hubcur` rather than zero.
+    """
+    name = "static"
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        if self.index.freq is None:
+            return chosen
+        row = self.index.freq[layer].masked_fill(hub, float("-inf"))
+        return _take_best(chosen, row, free)
+
+
+class ClusterRecencyRaw(_ClusterPolicy):
+    """mt_common.recency_set: the last k DISTINCT clusters, hubs NOT excluded.
+
+    This is the handicapped baseline. It burns a slot whenever the hub is
+    recent, which it almost always is. Every recency number from before the
+    Jul 26 correction was measured against this one, which is why it is kept.
+    Do not quote it as "recency" without the qualifier.
+
+    Overrides select() rather than _fill_budget() because it does not seed cur
+    separately -- cur is hist[-1] and lands first from the recency order.
+    """
+    name = "recency_raw"
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        raise AssertionError("unreachable: recency_raw overrides select()")
+
+    def select(self, layer, n_old, n_new):
+        assign = self._assign.get(layer)
+        if assign is None or n_old == 0:
+            return None
+        assign_old = assign[:, :n_old]
+
+        quota = torch.full((self.n_kv_heads,), self.k,
+                           device=self.device, dtype=torch.long)
+        chosen = torch.zeros(self.n_kv_heads, self.index.n_clusters,
+                             dtype=torch.bool, device=self.device)
+        chosen = _take_best(chosen, self._last[layer], quota)   # hubs eligible
+        chosen = chosen | self.index.hub_mask(layer)            # hub is resident anyway
+
+        self._chosen[layer] = chosen
+        return self._pin_sinks(torch.gather(chosen, 1, assign_old))
+
+
+class ClusterHybrid(_ClusterPolicy):
+    """mt_common.hybrid_set: split the k slots between flow and recency.
+
+    flow_slots = 0      fair (hub-excluded) recency, backfilled from flow
+                        when history runs dry. THIS is the honest recency
+                        baseline and the one the Jul 26 correction produced.
+    flow_slots = k-1    pure flow
+    flow_slots = None   alternate, flow first (degenerates to flow at k=2)
+
+    Same k as every other policy, so this is like-for-like, not an extra slot.
+    """
+    name = "hybrid"
+
+    def __init__(self, index, k, n_sink=4, flow_slots: Optional[int] = None):
+        super().__init__(index, k, n_sink)
+        self.flow_slots = flow_slots
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        flow_score = self._flow_row(layer, cur).masked_fill(hub, float("-inf"))
+        rec_score = self._last[layer].masked_fill(hub, float("-inf"))
+
+        if self.flow_slots is None:
+            return self._alternate(chosen, flow_score, rec_score, free)
+
+        to_flow = torch.full_like(free, int(self.flow_slots)).clamp_max(free)
+        chosen = _take_best(chosen, flow_score, to_flow)
+        chosen = _take_best(chosen, rec_score, (free - to_flow).clamp_min(0))
+        # whichever source ran dry, the other fills the remainder
+        shortfall = self.k - (chosen & ~hub).sum(dim=1)
+        return _take_best(chosen, flow_score, shortfall.clamp_min(0))
+
+    @staticmethod
+    def _alternate(chosen, flow_score, rec_score, free):
+        one = torch.ones_like(free)
+        use_flow, dry_rounds = True, 0
+        while int(free.max().item()) > 0 and dry_rounds < 2:
+            before = int(chosen.sum().item())
+            chosen = _take_best(chosen, flow_score if use_flow else rec_score,
+                                one.clamp_max(free))
+            dry_rounds = 0 if int(chosen.sum().item()) > before else dry_rounds + 1
+            free = (free - 1).clamp_min(0)
+            use_flow = not use_flow
+        return chosen
+
+
+class ClusterRouted(ClusterHybrid):
+    """Per-head routing on the fit's own local_frac.
+
+    local_frac is mean mass at offsets 0..4 -- how much of a head's attention
+    is pure recency. Heads BELOW the threshold are the ones the offline ladder
+    shows the flow graph winning on; heads above it are offset-rule heads where
+    LRU is simply the better model and no graph helps.
+
+    Identity checks, free of charge:
+        lf_threshold = 0.0  ==  recency_fair   (nothing routes to flow)
+        lf_threshold = 1.0  ==  flow           (everything does)
+    Both must hold exactly. That is the gate for this class.
+
+    The threshold is fitted on TRAIN shards only, so this is an a-priori rule,
+    not selection on the eval set.
+    """
+    name = "routed"
+
+    def __init__(self, index, k, n_sink=4, lf_threshold: float = 0.15):
+        super().__init__(index, k, n_sink, flow_slots=0)
+        if index.local_frac is None:
+            raise ValueError("routed needs local_frac in the --index npz")
+        self.lf_threshold = lf_threshold
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        flow_score = self._flow_row(layer, cur).masked_fill(hub, float("-inf"))
+        rec_score = self._last[layer].masked_fill(hub, float("-inf"))
+        lf = self.index.local_frac[layer].to(free.device)          # [Hkv]
+        to_flow = torch.where(lf < self.lf_threshold, free, torch.zeros_like(free))
+        chosen = _take_best(chosen, flow_score, to_flow)
+        chosen = _take_best(chosen, rec_score, (free - to_flow).clamp_min(0))
+        shortfall = self.k - (chosen & ~hub).sum(dim=1)
+        return _take_best(chosen, flow_score, shortfall.clamp_min(0))
+
+
+class ClusterOracle(_ClusterPolicy):
+    """Top-k clusters by the attention about to be placed. The ceiling for
+    CLUSTER granularity, exactly as Oracle is the ceiling for TOKEN
+    granularity. The gap between the two is the granularity tax with the flow
+    graph factored out entirely."""
+    name = "cluster_oracle"
+    needs_true_attention = True
+
+    def reset(self, *a, **kw):
+        super().reset(*a, **kw)
+        self._peek = {}
+
+    def set_peek(self, layer, col_mass_true_old):
+        self._peek[layer] = col_mass_true_old          # [Hkv, n_old]
+
+    def _fill_budget(self, layer, chosen, hub, cur, free):
+        peek = self._peek.get(layer)
+        if peek is None:
+            return chosen
+        assign = self._assign[layer][:, :peek.shape[1]]
+        by_cluster = torch.zeros(self.n_kv_heads, self.index.n_clusters,
+                                 dtype=torch.float32, device=self.device)
+        by_cluster.scatter_add_(1, assign, peek.float())
+        return _take_best(chosen, by_cluster.masked_fill(hub, float("-inf")), free)
+
+
+def cluster_recency_fair(index, k, n_sink=4) -> ClusterHybrid:
+    """The fair recency baseline: hybrid_set with flow_slots = 0."""
+    policy = ClusterHybrid(index, k, n_sink, flow_slots=0)
+    policy.name = "recency_fair"
+    return policy
+
+
+# ==========================================================================
+# registry
+# ==========================================================================
+
+TOKEN_POLICIES = ("full", "sink_only", "random", "oracle",
+                  "streaming", "h2o", "snapkv")
+CLUSTER_POLICIES = ("flow", "static", "recency_raw", "recency_fair",
+                    "hybrid", "routed", "cluster_oracle")
+
+# SnapKV's two published configurations. The paper's LongBench setting is
+# maxpool/kernel 7/window 32; the released repo's init_snapkv defaults are
+# avgpool/kernel 5/window 32. "Faithful to the paper" and "faithful to the
+# repo" are therefore different targets -- say which one a run used.
+SNAPKV_PAPER = dict(obs_window=32, pool=7, pooling="max")
+SNAPKV_REPO = dict(obs_window=32, pool=5, pooling="avg")
+
+
+def build(spec: str, budget: float, index: Optional[ClusterIndex] = None,
+          n_sink: int = 4, k: Optional[int] = None,
+          flow_slots: Optional[int] = None,
+          lf_threshold: float = 0.15,
+          snapkv_config: str = "paper") -> Policy:
+    name = spec.lower()
+
+    if name in TOKEN_POLICIES:
+        snap = SNAPKV_REPO if snapkv_config == "repo" else SNAPKV_PAPER
+        return {
+            "full":      lambda: FullCache(),
+            "sink_only": lambda: SinkOnly(n_sink),
+            "random":    lambda: RandomKeep(budget, n_sink),
+            "oracle":    lambda: Oracle(budget, n_sink),
+            "streaming": lambda: StreamingLLM(budget, n_sink),
+            "h2o":       lambda: H2O(budget, n_sink=n_sink),
+            "snapkv":    lambda: SnapKV(budget, n_sink=n_sink, **snap),
+        }[name]()
+
+    if name in CLUSTER_POLICIES:
+        if index is None:
+            raise ValueError(f"{name} needs a ClusterIndex (--index)")
+        if k is None:
+            raise ValueError(f"{name} needs a cluster budget (--ks)")
+        if name == "recency_fair":
+            return cluster_recency_fair(index, k, n_sink)
+        if name == "hybrid":
+            return ClusterHybrid(index, k, n_sink, flow_slots)
+        if name == "routed":
+            return ClusterRouted(index, k, n_sink, lf_threshold)
+        return {"flow": ClusterFlow, "static": ClusterStatic,
+                "recency_raw": ClusterRecencyRaw,
+                "cluster_oracle": ClusterOracle}[name](index, k, n_sink)
+
+    raise ValueError(f"unknown policy {spec!r}; "
+                     f"known: {TOKEN_POLICIES + CLUSTER_POLICIES}")

@@ -14,4 +14,4 @@ extracted_data/
 
 # raw corpora — see datasets/README.md for provenance + regeneration
 datasets/*
-!datasets/README.md
+!datasets/README.md.DS_Store
