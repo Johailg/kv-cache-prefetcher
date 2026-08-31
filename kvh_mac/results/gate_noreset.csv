@@ -1,0 +1,3 @@
+d_ppl,esc_rate,h_esc,kl,knob,knob_kind,n_tok,policy,ppl,ppl_t0,ppl_t1,ppl_t2,ppl_t3,ppl_t4,ppl_t5,ppl_t6,rec_esc,recovery,resid_spread,residency,top1
+0.0,0.0,nan,0.0,1.0,budget,1524,full,5.0389,13.833,5.068,4.796,5.3,5.847,3.343,4.233,0.0,1.0,0.0,1.0,1.0
+0.2259,0.0,nan,nan,8.0,budget,1524,page_oracle_noresetlag0,5.2648,13.651,5.082,4.889,5.701,6.034,3.515,4.573,0.0,0.8586,0.0047,0.1369,0.9022

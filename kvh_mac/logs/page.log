@@ -1,0 +1,14 @@
+=== START Sun Aug 16 22:13:47 IST 2026 ===
+/Users/gerry/Desktop/kv-cache-prefetcher/kv-cache-prefetcher/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+`torch_dtype` is deprecated! Use `dtype` instead!
+Qwen/Qwen3-0.6B: layers 28, kv heads 8, head_dim 128
+10 sessions, 18346 tokens, 92 assistant turns
+reference pass (full cache) ...
+  full           budget=1.0     resid 1.0000(+-0.000)  rec 1.0000  ppl 5.226  dppl +0.000  kl 0.0000  top1 1.0000  esc 0.000  rec|esc 0.0000  h_esc nan
+  page_oracle    budget=9.0     resid 0.1416(+-0.001)  rec 0.8635  ppl 5.372  dppl +0.146  kl nan  top1 0.9114  esc 0.000  rec|esc 0.0000  h_esc nan  [5105s]
+  page_oracle    budget=10.0    resid 0.1576(+-0.001)  rec 0.8759  ppl 5.335  dppl +0.109  kl nan  top1 0.9200  esc 0.000  rec|esc 0.0000  h_esc nan  [5163s]
+
+wrote results/e2e_page.csv
+plot d_ppl and kl against RESIDENCY, never against knob.
+=== EXIT 0 at Mon Aug 17 01:36:02 IST 2026 ===

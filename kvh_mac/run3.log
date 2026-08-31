@@ -1,0 +1,15 @@
+=== START Sat Aug 15 13:43:20 IST 2026 ===
+/Users/gerry/Documents/kvh/kvh_mac/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+`torch_dtype` is deprecated! Use `dtype` instead!
+Qwen/Qwen3-0.6B: layers 28, kv heads 8, head_dim 128
+10 sessions, 18346 tokens, 92 assistant turns
+escape readout on (C=64, thresh=0.25)
+reference pass (full cache) ...
+  full           budget=1.0     resid 1.0000(+-0.000)  rec 1.0000  ppl 5.226  dppl +0.000  kl 0.0000  top1 1.0000  esc 0.842  rec|esc 1.0000  h_esc nan
+  routed         k=4       resid 0.1418(+-0.013)  rec 0.7733  ppl 8.368  dppl +3.142  kl nan  top1 0.6972  esc 0.869  rec|esc 0.5424  h_esc 0.5015  [7803s]
+  cluster_oracle k=4       resid 0.1433(+-0.019)  rec 0.8451  ppl 5.605  dppl +0.379  kl nan  top1 0.8799  esc 0.861  rec|esc 0.6646  h_esc 0.8470  [7017s]
+
+wrote results/ppl_granularity.csv
+plot d_ppl and kl against RESIDENCY, never against knob.
+=== EXIT 0 at Sat Aug 15 19:04:48 IST 2026 ===

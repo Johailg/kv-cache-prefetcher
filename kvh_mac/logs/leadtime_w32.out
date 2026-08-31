@@ -1,0 +1,14 @@
+/Users/gerry/Desktop/kv-cache-prefetcher/kv-cache-prefetcher/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+`torch_dtype` is deprecated! Use `dtype` instead!
+Qwen/Qwen3-0.6B: layers 28, kv heads 8, head_dim 128
+10 sessions, 18346 tokens, 92 assistant turns
+reference pass (full cache) ...
+  full           budget=1.0     resid 1.0000(+-0.000)  rec 1.0000  ppl 5.226  dppl +0.000  kl 0.0000  top1 1.0000  esc 0.000  rec|esc 0.0000  h_esc nan
+  page_oracle_lag0 budget=8.0     resid 0.1354(+-0.005)  rec 0.8612  ppl 5.382  dppl +0.155  kl nan  top1 0.9102  esc 0.000  rec|esc 0.0000  h_esc nan  [5104s]
+  page_oracle_lag1 budget=8.0     resid 0.1362(+-0.004)  rec 0.8386  ppl 5.626  dppl +0.400  kl nan  top1 0.8831  esc 0.000  rec|esc 0.0000  h_esc nan  [5305s]
+  page_oracle_lag16 budget=8.0     resid 0.1476(+-0.003)  rec 0.8156  ppl 7.299  dppl +2.073  kl nan  top1 0.7948  esc 0.000  rec|esc 0.0000  h_esc nan  [5201s]
+  page_oracle_lag4 budget=8.0     resid 0.1384(+-0.004)  rec 0.8222  ppl 6.351  dppl +1.125  kl nan  top1 0.8324  esc 0.000  rec|esc 0.0000  h_esc nan  [5226s]
+
+wrote results/leadtime_w32.csv
+plot d_ppl and kl against RESIDENCY, never against knob.
