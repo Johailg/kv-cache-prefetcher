@@ -92,6 +92,22 @@ My prediction was not good, and the paging I adopted proved no extra value. But 
 
 One note on the blocks-beat-clusters result. It runs against published consensus — ClusterKV, LouisKV and others argue semantic clusters beat paging. My read is that those comparisons pit real *methods* against each other, and the page-based arm is usually Quest, whose per-page score is a crude min-max upper bound, so the literature conflates *grouping* with *estimator*. Take the estimator out by putting an oracle on both sides and blocks win. That disambiguation is the interesting part, not the bare claim.
 
+### What did work: routing by head
+
+The one constructive result. Heads are not alike, and which policy wins is predictable per head *before* you run anything.
+
+Define `local_frac` as the mean attention mass landing at offsets 0 to 4, computed on the training shards. It is an offset statistic, so it does not depend on the clustering at all — it is identical at C=64, 128 and 256, which means the router can be decided before committing to a cluster count.
+
+The rule: **if a head's `local_frac` is under 0.15, send it to the flow graph, otherwise send it to LRU.** The 0.15 threshold was pre-registered before the out-of-sample test.
+
+Tested on 200 heads (25 layers x 8 KV heads, fit on train sessions, scored on held-out ones), the rule holds on 173/200 at k=2, 175/200 at k=4, 165/200 at k=8. The raw percentage understates it, because the classes are imbalanced 40/160 and a rule that sent everything to LRU would score 80% by default. The real signal is the split: among the 40 low-`local_frac` heads the flow graph wins 33/29/27 at k=2/4/8, and among the 160 high ones it wins only 20/14/22.
+
+It replicates end to end. At matched residency, `routed` beats both pure policies: routed 8.425 at 0.1417 against recency_fair 9.056 at 0.1412 and flow 9.198 at 0.1387. (Those three are from the Delta run; the Mac reproduces routed at 8.368 / 0.1418, a 0.68% device drift that does not move the ordering.)
+
+Two honest caveats. Only 40 of 200 heads route to the flow graph, so the model-wide coverage gain is roughly +0.006, concentrated in the layers where low-`local_frac` heads cluster rather than spread evenly. And `routed` is still beaten by H2O at matched bytes — routing makes my method better than my other method, not better than the field.
+
+The post-hoc optimum threshold is 0.12, not 0.15. I am quoting the pre-registered 0.15 as the headline and noting 0.12 as post-hoc on the same set, because re-picking the threshold on the validation data would repeat the original sin.
+
 ---
 
 ## Repo layout
@@ -111,6 +127,42 @@ harness/, kvh_mac/       Phase 2, the kvh harness
 ```
 
 Every Phase 2 number came from `kvh_mac`, on a MacBook Air over MPS.
+
+---
+
+## Data and reproduction
+
+**Sessions.** Multi-turn chat sessions were drawn from **WildChat** (Zhao et al., ICLR 2024), streamed from the HuggingFace hub and filtered to conversations with at least 6 assistant turns that fit in 2048 tokens. WildChat is distributed under the **ODC-BY** license, which permits redistribution with attribution; the 50 sessions committed here as `chat_turns_test50.jsonl` are redistributed on that basis.
+
+> Zhao, Ren, Hessel, Cardie, Choi, Deng. *WildChat: 1M ChatGPT Interaction Logs in the Wild.* ICLR 2024.
+
+Phase 1 used `wikitext-103-v1` (validation split, word-tokenized) and `codeparrot-clean-valid`.
+
+**Train/test split is clean and verified.** The cluster index is fit on `chat_turns_train50.jsonl` and every number reported here is evaluated on `chat_turns_test50.jsonl`. A separately harvested test fit exists in `runs/qwen_all28_test/` and was never used for anything. No contamination.
+
+**Environment.** torch 2.8.0, transformers 4.57.6, pinned identically on the Mac (MPS) and on Delta (CUDA 12.8) so the two are comparable. Model is `Qwen/Qwen3-0.6B` throughout Phase 2, `EleutherAI/pythia-410m` throughout Phase 1.
+
+**Invocation.** Reconstructed from the run logs — check the flags against your own shell history before trusting them verbatim:
+
+```
+cd kvh_mac && source .venv/bin/activate
+export HF_HOME=$PWD/hf_cache PYTORCH_ENABLE_MPS_FALLBACK=1 \
+       TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+
+python run_ppl.py \
+  --model Qwen/Qwen3-0.6B \
+  --sessions chat_turns_test50.jsonl \
+  --max-len 2048 --min-turns 6 \
+  --device mps --dtype float32 --decode-chunk 1 \
+  --max-sessions 10 \
+  --budgets 8 \
+  --policies page_oracle_lag0,page_oracle_lag1,page_oracle_lag4,page_oracle_lag16 \
+  --out results/leadtime_w32.csv
+```
+
+`--decode-chunk 1` is exact; anything larger recomputes the mask every N tokens and needs an equivalence check first. `--dtype` offers only float32 and bfloat16, no float16.
+
+**A dead column.** `kl` comes back `nan` on every MPS row — `aggregate()` sums it without the nan filter it applies elsewhere, so one bad record poisons the whole row. The Delta rows have real KL values. This is why there is no second quality metric to cross-check perplexity, and why `top1` is quoted alongside `ppl` throughout: two metrics agreeing matters more than usual here.
 
 ---
 
@@ -173,3 +225,21 @@ Nothing here is trusted without a mechanical identity check. Every bug in this p
 **"Lead time is cheap" is conditional on the local window.** With W=32 the curve is logarithmically cheap. Without it the same measurement blows up, see `leadtime.csv`. Every real system keeps a local window so the claim stands, but the window is part of the architecture and has to be stated that way.
 
 **The oracle is a ceiling, not a method.** Nothing here is actually prefetched. No transfer counts, no measured speedup, and the contiguity advantage is unmeasured — which is the entire systems rationale for block granularity in the first place.
+
+---
+
+## Related work
+
+I have not done a citation-graph novelty pass, so there is no "to our knowledge" claim anywhere in this repo, and there should not be one until that pass happens.
+
+Two things a reader of this literature will want disambiguated:
+
+**Against ReSA** (Rectified Sparse Attention, 2506.04108), which sweeps a refresh interval over the same 16 to 128 range and finds the same saturation. The error source is different. ReSA's interval bounds how long errors in the cached KV *values* accumulate, because under sparse decoding each new token's K/V is computed from an already-approximate attention output, so the cache contents drift. My L bounds how long the *selection* stays stale, with cache contents exact throughout. Value drift versus selection staleness. Skimming their Figure 9 next to my curve will conflate them.
+
+**On the decomposition.** Splitting total loss into an oracle gap, an indexer gap and a realization gap is not mine — "How Much Dense Attention is Necessary?" (2606.07703) uses it as the organizing principle of the paper, on prefill in hybrid models. Mine is the decode-side counterpart with a lead-time axis they do not have.
+
+**On blocks beating clusters**, see the note in Phase 2. ClusterKV (DAC'25) and LouisKV argue the opposite; my claim is that their comparisons conflate grouping with estimator.
+
+## Acknowledgments
+
+Compute for the Phase 2 harvests and the Delta runs was provided through ACCESS allocation **CIS240055**, "AI efficiency research projects", on **NCSA Delta**, shared by **Prof. Minjia Zhang** (SSAIL, UIUC). Prof. Zhang also gave the feedback that redirected this work from attention recovery to end-to-end accuracy, which is the reason Phase 2 exists in its current form.
